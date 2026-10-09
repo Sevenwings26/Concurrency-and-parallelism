@@ -1,0 +1,2280 @@
+# DAY 2 — MASTER CONCURRENCY, PARALLELISM, ASYNCHRONOUS I/O, RESOURCE MANAGEMENT & BACKPRESSURE
+
+## Backend + AI Engineering — 90-Day Horizon
+
+---
+
+# 0. DAY 2 OBJECTIVE
+
+Senior backend engineers do not merely know how to create asynchronous functions or spawn goroutines.
+
+They understand:
+
+* how work is executed;
+* where parallelism comes from;
+* how resources become saturated;
+* how concurrent work is bounded;
+* how cancellation propagates;
+* how queues form;
+* how failures spread;
+* how backpressure protects a system;
+* and how latency, throughput and capacity interact.
+
+For Backend + AI/RAG systems, this is critical because one user request may trigger:
+
+```text
+HTTP Request
+     ↓
+Authentication / Authorization
+     ↓
+Query Processing
+     ↓
+Embedding
+     ↓
+Vector Search
+     ↓
+Metadata / SQL Query
+     ↓
+Reranking
+     ↓
+LLM Inference
+     ↓
+Response Synthesis
+```
+
+These operations do not all have the same execution characteristics.
+
+Some are:
+
+* CPU-bound
+* I/O-bound
+* GPU-bound
+* memory-bound
+* connection-bound
+* rate-limit-bound
+* queue-bound
+
+The senior-engineering question is therefore not:
+
+> "Should I use async?"
+
+The better question is:
+
+> **"What resource is limiting this operation, what execution model does it require, and how do I control concurrency without destabilizing the system?"**
+
+---
+
+# 1. THE FOUR CONCEPTS YOU MUST NOT CONFUSE
+
+## 1.1 Concurrency
+
+Concurrency is the ability of a system to make progress on multiple units of work during overlapping periods.
+
+It does NOT necessarily mean that work executes simultaneously.
+
+Example:
+
+```text
+Task A: ── DB WAIT ──────────────── Done
+Task B:       ── HTTP WAIT ──────── Done
+Task C:            ── DB WAIT ───── Done
+```
+
+A single execution thread can coordinate many I/O-bound tasks by switching between them when one is waiting.
+
+---
+
+## 1.2 Parallelism
+
+Parallelism means multiple computations execute simultaneously.
+
+Example:
+
+```text
+CPU 1 → Task A
+CPU 2 → Task B
+CPU 3 → Task C
+CPU 4 → Task D
+```
+
+Parallelism requires actual execution resources capable of simultaneous work, such as multiple CPU cores or GPU execution units.
+
+### Key distinction
+
+```text
+Concurrency = dealing with multiple things at once.
+
+Parallelism = doing multiple things at the same time.
+```
+
+A system can be highly concurrent without executing work in parallel.
+
+---
+
+# 2. ASYNC ≠ MULTITHREADING ≠ MULTIPROCESSING
+
+These are different execution mechanisms.
+
+## Asynchronous execution
+
+Usually means:
+
+> Start an operation and allow other work to proceed while waiting for its completion.
+
+Typical example:
+
+```python
+result = await database.fetch(...)
+```
+
+The coroutine yields control while the database operation is in progress.
+
+---
+
+## Multithreading
+
+Multiple OS-managed threads execute within one process.
+
+Threads share process memory.
+
+Useful for:
+
+* blocking I/O;
+* some native-library workloads;
+* workloads where the runtime/library can execute outside the interpreter lock.
+
+But shared memory introduces synchronization concerns.
+
+---
+
+## Multiprocessing
+
+Multiple OS processes execute independently.
+
+Each process has its own:
+
+* memory space;
+* interpreter/runtime state;
+* resources;
+* failure boundary.
+
+This is useful for CPU-bound Python work where process-level parallelism is appropriate.
+
+---
+
+## Goroutine
+
+Go's goroutines are lightweight runtime-managed execution units.
+
+They are not equivalent to OS threads.
+
+The Go runtime multiplexes goroutines over OS threads and manages scheduling, blocking, synchronization and work distribution.
+
+---
+
+# 3. HARDWARE LEVEL — WHAT ACTUALLY EXECUTES CODE?
+
+The CPU executes machine instructions.
+
+An OS thread provides an execution context managed by the operating system.
+
+When the operating system schedules different threads, it may need to perform scheduler work and restore execution state. This can also disturb CPU-cache and TLB locality.
+
+Therefore:
+
+> OS-thread scheduling is generally more expensive than lightweight user-space task scheduling, but the exact cost is platform- and workload-dependent.
+
+Do not memorize fixed numbers such as:
+
+```text
+OS context switch = X nanoseconds
+goroutine switch = Y nanoseconds
+```
+
+Those numbers are not architectural constants.
+
+When the number actually matters:
+
+> **Benchmark the workload on the target hardware and runtime.**
+
+---
+
+# 4. PYTHON AND THE GIL
+
+## Traditional CPython execution
+
+Traditional CPython builds use the Global Interpreter Lock (GIL).
+
+The GIL prevents multiple threads from simultaneously executing Python bytecode within the same interpreter.
+
+This means:
+
+```text
+Thread A → Python bytecode
+Thread B → waiting
+Thread C → waiting
+Thread D → waiting
+```
+
+for the relevant interpreter execution.
+
+### Important qualification
+
+The GIL does NOT mean:
+
+> "Python can only use one CPU."
+
+Python applications can still use multiple cores through:
+
+* multiple processes;
+* native extensions;
+* external services;
+* GPU computation;
+* appropriate runtime configurations.
+
+Modern Python also supports free-threaded configurations in which the GIL can be disabled, although compatibility and performance characteristics differ.
+
+Therefore:
+
+> **Always tie GIL assumptions to the Python runtime/build actually deployed.**
+
+---
+
+# 5. PYTHON THREADING
+
+Threads are useful, but the workload matters.
+
+For CPU-heavy pure-Python computation under a traditional GIL-enabled CPython runtime:
+
+```text
+Thread 1 → Python CPU work
+Thread 2 → Python CPU work
+Thread 3 → Python CPU work
+```
+
+does not provide the same CPU parallelism as independent processes.
+
+For blocking I/O:
+
+```text
+Thread → waiting for network
+Thread → waiting for database
+Thread → waiting for filesystem
+```
+
+threads can still be useful.
+
+Threads may also execute native-library operations that release the interpreter lock.
+
+Therefore:
+
+> **Do not classify threading as universally good or bad. Classify the workload first.**
+
+---
+
+# 6. PYTHON ASYNCIO
+
+`asyncio` provides cooperative asynchronous execution.
+
+A typical architecture looks like:
+
+```text
+              Event Loop
+                  │
+       ┌──────────┼──────────┐
+       ↓          ↓          ↓
+    Task A     Task B      Task C
+       │          │          │
+    DB wait    HTTP wait   Redis wait
+       │          │          │
+       └────── yield ────────┘
+```
+
+When a coroutine reaches an awaitable I/O operation, it can yield control so another task can make progress.
+
+This makes asynchronous programming highly effective for I/O-heavy workloads.
+
+---
+
+## The event-loop rule
+
+Never perform substantial blocking work directly on the event-loop thread.
+
+Bad:
+
+```python
+@app.get("/process")
+async def process():
+    result = expensive_python_computation()
+    return result
+```
+
+If the computation occupies the event loop for a long time, other requests cannot make progress on that event loop.
+
+Better:
+
+```text
+Async request
+     ↓
+Identify blocking/CPU-heavy work
+     ↓
+Offload to appropriate execution mechanism
+     ↓
+Continue async orchestration
+```
+
+Possible mechanisms include:
+
+* thread pool;
+* process pool;
+* interpreter-based execution where appropriate;
+* optimized native implementation;
+* external worker/service.
+
+The correct mechanism depends on the workload.
+
+---
+
+# 7. GO'S CONCURRENCY MODEL
+
+Go does not use a GIL to serialize ordinary Go-code execution.
+
+Its concurrency model is built around:
+
+```text
+Goroutines
+     ↓
+Go Runtime Scheduler
+     ↓
+OS Threads
+     ↓
+CPU
+```
+
+Go uses an M scheduling model.
+
+Conceptually:
+
+```text
+Many Goroutines
+      ↓
+Runtime Scheduler
+      ↓
+Fewer / variable OS Threads
+      ↓
+Available CPU execution resources
+```
+
+The important point is that:
+
+> **Goroutines are not OS threads.**
+
+---
+
+# 8. GO'S G-M-P MODEL
+
+The Go runtime scheduler is commonly described using three components.
+
+## G — Goroutine
+
+A goroutine represents a unit of Go execution.
+
+Example:
+
+```go
+go processDocument(doc)
+```
+
+creates concurrent work.
+
+---
+
+## M — Machine
+
+An M represents an OS thread.
+
+The runtime may create and manage multiple Ms.
+
+An M is the actual OS execution thread on which Go code runs.
+
+---
+
+## P — Processor
+
+A P represents the logical scheduling resource required for an M to execute Go code.
+
+The number of Ps is controlled by:
+
+```go
+runtime.GOMAXPROCS(...)
+```
+
+The effective default is based on available execution capacity, including logical CPUs and applicable CPU affinity/container limits.
+
+Therefore avoid teaching:
+
+> "P = physical CPU core."
+
+A better mental model is:
+
+> **P represents the runtime's available logical execution capacity for running Go code concurrently.**
+
+---
+
+# 9. GO SCHEDULING — THE SENIOR MENTAL MODEL
+
+Do not memorize runtime implementation trivia.
+
+Understand the engineering behavior.
+
+The Go runtime:
+
+* schedules goroutines;
+* maintains runnable work;
+* performs work stealing;
+* manages local/global run queues;
+* handles blocked operations;
+* integrates with the network poller;
+* supports asynchronous preemption;
+* manages OS threads;
+* attempts to keep available CPU resources productive.
+
+If a goroutine becomes blocked:
+
+```text
+Goroutine A
+     ↓
+Blocking operation
+     ↓
+Runtime manages the blocked work
+     ↓
+Another runnable goroutine can execute
+```
+
+This is one of the reasons Go can support large numbers of concurrent tasks with relatively low programming overhead.
+
+---
+
+# 10. PREEMPTION
+
+A CPU-heavy goroutine should not be allowed to monopolize execution indefinitely.
+
+Modern Go supports asynchronous preemption, allowing the runtime to interrupt goroutines that execute for extended periods without voluntarily blocking or yielding.
+
+The exact runtime implementation is version-specific.
+
+The engineering principle is what matters:
+
+> **A CPU-bound goroutine must not permanently prevent other goroutines from making progress.**
+
+---
+
+# 11. DJANGO vs FASTAPI vs GO
+
+Framework choice should be driven by workload, architecture and operational requirements—not simplistic claims that one technology "scales" and another does not.
+
+## Django
+
+Strengths:
+
+* mature web framework;
+* ORM;
+* authentication;
+* admin;
+* batteries-included architecture;
+* rapid CRUD/application development.
+
+Good fit for:
+
+* business applications;
+* dashboards;
+* conventional web systems;
+* transactional applications;
+* systems where Django's ecosystem provides significant leverage.
+
+Django can also support asynchronous views and ASGI deployment where appropriate.
+
+---
+
+## FastAPI
+
+Strengths:
+
+* Python ecosystem;
+* type-driven API development;
+* ASGI;
+* asynchronous request handling;
+* excellent integration with AI/ML tooling.
+
+Good fit for:
+
+* AI APIs;
+* RAG services;
+* model orchestration;
+* microservices;
+* I/O-heavy APIs;
+* inference gateways.
+
+FastAPI does not magically make Python CPU-bound code parallel.
+
+Its advantage is particularly strong when the workload involves substantial asynchronous I/O and external services.
+
+---
+
+## Go
+
+Strengths:
+
+* lightweight concurrency model;
+* strong runtime scheduling;
+* efficient networking;
+* static compilation;
+* strong performance characteristics;
+* excellent operational simplicity.
+
+Good fit for:
+
+* infrastructure services;
+* networking;
+* high-throughput APIs;
+* streaming systems;
+* distributed systems;
+* concurrency-heavy services;
+* performance-sensitive components.
+
+The correct conclusion is not:
+
+> "Go is always faster."
+
+The correct conclusion is:
+
+> **Choose the execution model that fits the workload and measure the resulting system.**
+
+---
+
+# 12. FASTAPI + AI: WHERE DOES THE WORK ACTUALLY HAPPEN?
+
+AI applications complicate the Python-vs-Go discussion.
+
+Consider:
+
+```text
+FastAPI
+   ↓
+Python orchestration
+   ↓
+Embedding library
+   ↓
+Native CPU/GPU implementation
+   ↓
+Vector database
+   ↓
+Reranker
+   ↓
+LLM inference server
+```
+
+Python may be orchestrating the system while the expensive computation happens elsewhere.
+
+Examples include:
+
+* C/C++;
+* Rust;
+* CUDA;
+* GPU kernels;
+* external inference servers;
+* database engines;
+* vector databases.
+
+Therefore:
+
+> **Do not assume that Python is the bottleneck simply because the API is written in Python.**
+
+Measure the system.
+
+---
+
+# 13. AI LIBRARIES AND THE GIL
+
+Libraries such as numerical and ML frameworks often execute substantial computation in native implementations.
+
+For example:
+
+```text
+Python
+   ↓
+PyTorch / NumPy
+   ↓
+C/C++ / optimized kernels
+   ↓
+CPU / GPU
+```
+
+The native implementation may release the GIL where appropriate.
+
+This means a Python process can sometimes remain responsive while native computation proceeds.
+
+But do not conclude:
+
+> "Python orchestration is always insignificant."
+
+Python can still become a bottleneck through:
+
+* preprocessing;
+* tokenization;
+* serialization;
+* object creation;
+* data transformation;
+* scheduling;
+* synchronization;
+* inefficient loops;
+* excessive copying;
+* orchestration overhead.
+
+The correct rule is:
+
+> **Profile before optimizing.**
+
+---
+
+# 14. THE RAG PERFORMANCE MODEL
+
+A production RAG request may look like:
+
+```text
+Request
+  │
+  ├── Authentication
+  │
+  ├── Query preprocessing
+  │
+  ├── Embedding
+  │
+  ├── Vector search
+  │
+  ├── Metadata filtering
+  │
+  ├── SQL lookup
+  │
+  ├── Reranking
+  │
+  ├── Context assembly
+  │
+  ├── LLM inference
+  │
+  └── Response serialization
+```
+
+Total latency is therefore approximately:
+
+```text
+Total Latency
+=
+Queueing
++ Network
++ DB
++ Vector Retrieval
++ Reranking
++ Model Inference
++ Serialization
++ Application Execution
+```
+
+Do not optimize the Python layer automatically.
+
+First identify the dominant term.
+
+---
+
+# 15. RESOURCE-CAPACITY MODEL
+
+Every concurrent system is constrained by finite resources.
+
+Typical RAG resources include:
+
+```text
+CPU
+Memory
+GPU VRAM
+Database connections
+Redis connections
+HTTP connections
+File descriptors
+Vector DB capacity
+LLM inference capacity
+API rate limits
+Network bandwidth
+Queue capacity
+```
+
+A system becomes unstable when incoming work consistently exceeds the capacity of one or more critical resources.
+
+---
+
+# 16. CONCURRENCY BUDGET
+
+A senior engineer should be able to answer:
+
+> "How many operations can safely execute at the same time?"
+
+For example:
+
+```text
+API
+ ├── max concurrent requests: 500
+ │
+ ├── DB connections: 50
+ │
+ ├── vector searches: 100
+ │
+ ├── reranking jobs: 20
+ │
+ └── LLM requests: 10
+```
+
+The application cannot safely assume that because it can accept 500 HTTP requests, it can execute 500 expensive RAG pipelines simultaneously.
+
+The real capacity may be determined by the narrowest resource.
+
+This is a form of:
+
+> **Resource-aware concurrency budgeting.**
+
+---
+
+# 17. LITTLE'S LAW
+
+A foundational relationship in queueing theory is:
+
+```text
+L = λW
+```
+
+Where:
+
+```text
+L = average number of items in the system
+λ = average arrival rate
+W = average time spent in the system
+```
+
+Example:
+
+```text
+Arrival rate = 20 requests/sec
+Average latency = 0.5 sec
+
+L = 20 × 0.5
+L = 10 concurrent requests
+```
+
+This gives a powerful engineering intuition:
+
+> **If throughput stays constant while latency increases, the amount of work in the system increases.**
+
+Little's Law describes a stable system over the relevant observation interval; it does not by itself guarantee that the system is stable.
+
+---
+
+# 18. THROUGHPUT vs LATENCY
+
+These are different metrics.
+
+## Latency
+
+How long one operation takes.
+
+Measure:
+
+```text
+p50
+p95
+p99
+p99.9
+```
+
+Tail latency matters heavily in enterprise systems.
+
+---
+
+## Throughput
+
+How much work the system completes per unit time.
+
+Examples:
+
+```text
+Requests/sec
+Documents/sec
+Tokens/sec
+Queries/sec
+Jobs/minute
+```
+
+A system can have:
+
+```text
+High throughput + high latency
+```
+
+or:
+
+```text
+Low throughput + low latency
+```
+
+Neither metric should be evaluated in isolation.
+
+---
+
+# 19. QUEUEING
+
+When demand exceeds immediate execution capacity, work waits.
+
+Example:
+
+```text
+Incoming Requests
+       ↓
+    Queue
+       ↓
+┌──────┼──────┐
+Worker Worker Worker
+```
+
+Queueing can be useful because it smooths temporary bursts.
+
+But unlimited queues are dangerous.
+
+An unlimited queue can turn:
+
+```text
+Overload
+```
+
+into:
+
+```text
+Memory growth
+→
+Increasing latency
+→
+Timeouts
+→
+Retries
+→
+More work
+→
+System collapse
+```
+
+This is one form of cascading failure.
+
+---
+
+# 20. CONCURRENCY LIMITING
+
+Concurrency limiting means:
+
+> Only N operations may execute simultaneously.
+
+Example:
+
+```python
+semaphore = asyncio.Semaphore(20)
+```
+
+Conceptually:
+
+```text
+100 incoming requests
+        ↓
+Only 20 expensive operations execute
+        ↓
+Others wait / queue / are rejected
+```
+
+But a semaphore does NOT automatically mean:
+
+> "The 21st request receives HTTP 429."
+
+That is a separate admission-control decision.
+
+---
+
+# 21. CONCURRENCY LIMITING vs QUEUEING vs LOAD SHEDDING
+
+These must be distinguished.
+
+## Concurrency limiting
+
+Controls how many operations execute simultaneously.
+
+```text
+MAX = 20
+```
+
+---
+
+## Queueing
+
+Allows excess work to wait.
+
+```text
+20 executing
+80 waiting
+```
+
+Useful when the work can tolerate waiting.
+
+---
+
+## Load shedding
+
+Rejects work that cannot be safely admitted.
+
+```text
+20 executing
+10 queued
+70 rejected
+```
+
+Example:
+
+```http
+429 Too Many Requests
+```
+
+or:
+
+```http
+503 Service Unavailable
+```
+
+depending on the semantics.
+
+### Senior principle
+
+> **A bounded queue plus admission control is usually safer than unlimited waiting.**
+
+---
+
+# 22. BACKPRESSURE
+
+Backpressure means:
+
+> **The downstream system communicates capacity constraints to upstream producers so work does not overwhelm the system.**
+
+Example:
+
+```text
+Client
+  ↓
+API
+  ↓
+RAG Gateway
+  ↓
+LLM Service
+```
+
+Suppose the LLM service can safely process only 10 concurrent requests.
+
+The gateway should not blindly send 1,000 simultaneous requests.
+
+Instead:
+
+```text
+                    ┌── LLM ──┐
+                    │ capacity│
+                    │   = 10  │
+                    └────┬────┘
+                         ↑
+                    bounded
+                     concurrency
+                         ↑
+                       API
+```
+
+This protects:
+
+* memory;
+* latency;
+* downstream services;
+* connection pools;
+* GPU memory;
+* rate limits.
+
+---
+
+# 23. ADMISSION CONTROL
+
+Admission control answers:
+
+> **Should this request enter the expensive part of the system at all?**
+
+Possible signals:
+
+* current queue depth;
+* CPU utilization;
+* memory pressure;
+* GPU utilization;
+* downstream capacity;
+* request priority;
+* tenant quota;
+* rate limit;
+* deadline remaining.
+
+Example:
+
+```text
+Request
+   ↓
+Can system safely accept it?
+   ├── YES → execute
+   └── NO  → reject / degrade / defer
+```
+
+This is different from simply placing every request into a queue.
+
+---
+
+# 24. RATE LIMITING
+
+Concurrency limits control:
+
+> How many operations are active now?
+
+Rate limits control:
+
+> How frequently operations may arrive.
+
+Examples:
+
+```text
+100 requests/minute
+10 LLM requests/sec
+5 ingestion jobs/sec
+```
+
+Common approaches include:
+
+* token bucket;
+* leaky bucket;
+* fixed window;
+* sliding window.
+
+In distributed systems, rate limiting may need shared state through Redis or another coordination mechanism.
+
+---
+
+# 25. GRACEFUL DEGRADATION
+
+When capacity is constrained, a mature system does not always have only two choices:
+
+```text
+Success
+Failure
+```
+
+It can degrade intelligently.
+
+For a RAG system:
+
+```text
+Normal:
+Vector Search
++ Reranking
++ LLM
+
+Degraded:
+Vector Search
++ LLM
+
+Further degraded:
+Cached answer / limited retrieval
+
+Overloaded:
+Reject request
+```
+
+This preserves core availability instead of allowing every component to fail simultaneously.
+
+---
+
+# 26. TIMEOUTS
+
+Every remote or potentially blocking operation should have an appropriate timeout.
+
+Examples:
+
+```text
+HTTP timeout
+DB timeout
+Vector search timeout
+LLM timeout
+Queue wait timeout
+Overall request deadline
+```
+
+Timeouts should propagate.
+
+Example:
+
+```text
+HTTP Request
+deadline = 5 seconds
+
+    ↓
+DB
+    ≤ 1 second
+
+    ↓
+Vector DB
+    ≤ 1 second
+
+    ↓
+LLM
+    ≤ remaining deadline
+```
+
+A downstream service should not continue expensive work after the caller has already abandoned the request.
+
+---
+
+# 27. CANCELLATION
+
+Cancellation is part of concurrency correctness.
+
+Consider:
+
+```text
+User Request
+   ↓
+RAG Pipeline
+   ├── SQL
+   ├── Qdrant
+   ├── Reranker
+   └── LLM
+```
+
+If the client disconnects:
+
+```text
+Client Gone
+    ↓
+Cancel parent operation
+    ↓
+Cancel child tasks
+    ↓
+Stop unnecessary DB/vector/LLM work
+```
+
+Without cancellation, the system may continue consuming resources for work nobody will ever receive.
+
+---
+
+# 28. STRUCTURED CONCURRENCY
+
+Every concurrent task should have:
+
+1. An owner.
+2. A defined lifetime.
+3. A cancellation mechanism.
+4. An error-propagation path.
+5. A completion/join point.
+
+Ask:
+
+```text
+Who started this task?
+Who owns it?
+Who cancels it?
+Who observes its failure?
+Who waits for it?
+What happens if the parent request disappears?
+```
+
+In Go, this often maps naturally to:
+
+```text
+context.Context
++
+errgroup
+```
+
+In modern Python:
+
+```text
+asyncio.TaskGroup
++
+timeouts
++
+cancellation
+```
+
+The principle is:
+
+> **Concurrent work should have a lifecycle.**
+
+---
+
+# 29. GO ERROR PROPAGATION
+
+Avoid creating uncontrolled goroutines:
+
+```go
+go doSomething()
+```
+
+and then forgetting about them.
+
+A better design establishes ownership.
+
+For request-scoped parallel work:
+
+```text
+Parent request
+      │
+      ├── task A
+      ├── task B
+      └── task C
+```
+
+The parent should know:
+
+* when children finish;
+* whether one failed;
+* whether others should be cancelled;
+* whether results are still needed.
+
+This is the foundation of structured concurrency.
+
+---
+
+# 30. PYTHON CONCURRENT RAG PATTERN
+
+Suppose a RAG query requires:
+
+```text
+Vector Search
+SQL Metadata
+Document Permissions
+```
+
+These operations may be independent.
+
+Conceptually:
+
+```text
+                RAG Request
+                    │
+          ┌─────────┼─────────┐
+          ↓         ↓         ↓
+       Qdrant      SQL      RBAC
+          │         │         │
+          └─────────┼─────────┘
+                    ↓
+              Result Fusion
+                    ↓
+                  LLM
+```
+
+If they are genuinely independent, execute them concurrently.
+
+But do not create unlimited concurrency.
+
+Use:
+
+```text
+bounded concurrency
++
+timeouts
++
+cancellation
++
+error handling
+```
+
+---
+
+# 31. RETRIES ARE NOT FREE
+
+Retries can improve resilience.
+
+But uncontrolled retries can amplify overload.
+
+Example:
+
+```text
+100 requests
+   ↓
+Downstream overloaded
+   ↓
+100 failures
+   ↓
+Each retries 3 times
+   ↓
+300 additional requests
+```
+
+This can create a retry storm.
+
+Use:
+
+* exponential backoff;
+* jitter;
+* retry limits;
+* idempotency;
+* deadline awareness;
+* retry only transient failures.
+
+---
+
+# 32. RESOURCE POOLS
+
+Resource pooling is critical for high-concurrency systems.
+
+Examples:
+
+```text
+DB connection pool
+HTTP connection pool
+Redis connection pool
+Thread pool
+Worker pool
+GPU inference pool
+```
+
+Avoid creating expensive resources repeatedly.
+
+For HTTP clients:
+
+```text
+Bad:
+request → create client → connect → request → destroy
+
+Better:
+application lifetime
+        ↓
+long-lived client
+        ↓
+connection pooling
+        ↓
+many requests
+```
+
+The exact cost of creating a new connection varies with DNS, TLS, network conditions, HTTP version and infrastructure.
+
+The durable principle is:
+
+> **Reuse long-lived connections where appropriate.**
+
+---
+
+# 33. FILE DESCRIPTORS AND EPHEMERAL PORTS
+
+High concurrency consumes operating-system resources.
+
+Excessive short-lived outbound connections can exhaust:
+
+* file descriptors;
+* ephemeral ports;
+* connection tracking state;
+* server connection limits.
+
+The exact ephemeral-port range varies by OS and configuration.
+
+Therefore:
+
+> **Connection pooling and controlled concurrency are resource-management mechanisms, not merely performance optimizations.**
+
+---
+
+# 34. LLM CONCURRENCY AND GPU MEMORY
+
+LLM systems introduce another constraint:
+
+```text
+GPU VRAM
+```
+
+For inference systems, memory may be consumed by:
+
+* model weights;
+* activations;
+* KV cache;
+* runtime buffers;
+* batching;
+* concurrent sequences.
+
+KV-cache memory generally grows approximately linearly with sequence length and concurrent sequences.
+
+The exact requirement depends on:
+
+* number of layers;
+* KV-head configuration;
+* head dimension;
+* datatype;
+* attention architecture;
+* sequence length;
+* number of active sequences.
+
+Therefore:
+
+> **LLM concurrency is ultimately constrained by model architecture and available memory, not simply by HTTP capacity.**
+
+---
+
+# 35. RAG BACKPRESSURE ARCHITECTURE
+
+A production architecture might look like:
+
+```text
+                   Clients
+                      │
+                      ↓
+              API / Gateway
+                      │
+             Admission Control
+                      │
+              Rate Limiter
+                      │
+          ┌───────────┴───────────┐
+          ↓                       ↓
+   Request Queue            Reject / Degrade
+          │
+   Bounded Worker Pool
+          │
+    ┌─────┼───────────┐
+    ↓     ↓           ↓
+  SQL   Qdrant      Other I/O
+    │     │           │
+    └─────┼───────────┘
+          ↓
+       Reranker
+          ↓
+     LLM Gateway
+          ↓
+      LLM Server
+          ↓
+       Response
+```
+
+Every expensive stage should have an explicit capacity model.
+
+---
+
+# 36. OBSERVABILITY
+
+Concurrency without observability is guesswork.
+
+Track:
+
+## Throughput
+
+```text
+requests/sec
+jobs/sec
+documents/sec
+tokens/sec
+```
+
+## Latency
+
+```text
+p50
+p95
+p99
+p99.9
+```
+
+## Saturation
+
+```text
+CPU
+memory
+GPU
+DB connections
+queue depth
+worker utilization
+```
+
+## Errors
+
+```text
+timeouts
+429s
+503s
+5xx
+LLM failures
+DB failures
+cancellation rate
+retry rate
+```
+
+## Concurrency
+
+```text
+active requests
+active workers
+active DB queries
+active LLM requests
+```
+
+The objective is not merely to know that the system is slow.
+
+It is to answer:
+
+> **What resource is saturated and why?**
+
+---
+
+# 37. RACE CONDITIONS
+
+Concurrency introduces shared-state hazards.
+
+Example:
+
+```text
+Goroutine A ──┐
+              ├── shared variable
+Goroutine B ──┘
+```
+
+Both modify the same state.
+
+Possible solutions:
+
+* mutex;
+* atomic operations;
+* channels;
+* ownership transfer;
+* immutable data;
+* database transactions.
+
+In Go:
+
+```bash
+go test -race ./...
+```
+
+The race detector is a valuable development tool.
+
+The deeper principle is:
+
+> **Prefer designs that minimize shared mutable state.**
+
+---
+
+# 38. DEADLOCKS
+
+A deadlock occurs when concurrent work waits indefinitely for conditions that cannot be satisfied.
+
+Classic example:
+
+```text
+Task A holds Lock 1
+      ↓
+waits for Lock 2
+
+Task B holds Lock 2
+      ↓
+waits for Lock 1
+```
+
+Result:
+
+```text
+A waits for B
+B waits for A
+```
+
+Neither progresses.
+
+Senior engineers recognize:
+
+* lock ordering;
+* circular waits;
+* channel deadlocks;
+* blocked producers;
+* blocked consumers;
+* leaked goroutines/tasks.
+
+---
+
+# 39. GOROUTINE / TASK LEAKS
+
+A concurrent task can outlive the operation that created it.
+
+Example:
+
+```text
+HTTP Request
+    ↓
+Start background goroutine
+    ↓
+Request completes
+    ↓
+Goroutine continues forever
+```
+
+Repeated frequently:
+
+```text
+10 requests → 10 leaked tasks
+1,000 requests → 1,000 leaked tasks
+```
+
+Eventually:
+
+```text
+Memory ↑
+Connections ↑
+CPU ↑
+Latency ↑
+```
+
+Senior rule:
+
+> **Every long-lived concurrent task must have an explicit owner and termination strategy.**
+
+---
+
+# 40. WORKER POOLS
+
+A worker pool provides bounded concurrency.
+
+```text
+                Queue
+                  │
+       ┌──────────┼──────────┐
+       ↓          ↓          ↓
+    Worker 1   Worker 2   Worker 3
+       │          │          │
+       └──────────┼──────────┘
+                  ↓
+                Done
+```
+
+Useful for:
+
+* document ingestion;
+* embedding generation;
+* file processing;
+* OCR;
+* batch database operations;
+* external API calls;
+* background jobs.
+
+The number of workers should be based on resource capacity—not arbitrary preference.
+
+---
+
+# 41. FAN-OUT / FAN-IN
+
+Fan-out:
+
+```text
+              Request
+             /   |   \
+            A    B    C
+```
+
+Fan-in:
+
+```text
+            A    B    C
+             \   |   /
+              Results
+```
+
+For example:
+
+```text
+Query
+ ├── SQL
+ ├── Vector Search
+ ├── Permission Check
+ └── Cache
+       ↓
+    Combine
+       ↓
+      LLM
+```
+
+The challenge is controlling:
+
+* number of branches;
+* timeout behavior;
+* cancellation;
+* partial failures;
+* result ordering;
+* resource usage.
+
+---
+
+# 42. PIPELINES
+
+A pipeline separates processing stages.
+
+Example:
+
+```text
+Ingest
+  ↓
+Parse
+  ↓
+Clean
+  ↓
+Chunk
+  ↓
+Embed
+  ↓
+Store
+```
+
+Each stage can have a bounded queue.
+
+This allows backpressure to propagate:
+
+```text
+Storage slow
+    ↓
+Embedding queue fills
+    ↓
+Chunking slows
+    ↓
+Parsing slows
+    ↓
+Ingestion slows
+```
+
+Instead of allowing unlimited memory growth.
+
+---
+
+# 43. PRACTICAL DAY 2 PROJECT
+
+## Project: Concurrent Document Processing Engine
+
+Build the same workload in Python and Go.
+
+The system processes documents through:
+
+```text
+Input Documents
+      ↓
+Parse
+      ↓
+Chunk
+      ↓
+Embed
+      ↓
+Store
+```
+
+---
+
+## VERSION 1 — BASIC CONCURRENCY
+
+### Python
+
+Implement:
+
+```text
+asyncio
+async/await
+asyncio.gather
+```
+
+### Go
+
+Implement:
+
+```text
+goroutines
+channels
+```
+
+Goal:
+
+Understand concurrency mechanics.
+
+---
+
+# VERSION 2 — WORKER POOL
+
+Implement:
+
+```text
+Producer
+   ↓
+Bounded Queue
+   ↓
+Workers
+   ↓
+Results
+```
+
+Measure:
+
+* throughput;
+* queue depth;
+* latency.
+
+---
+
+# VERSION 3 — CANCELLATION
+
+Add:
+
+```text
+Python:
+asyncio cancellation
+
+Go:
+context.Context
+```
+
+Simulate:
+
+```text
+Client disconnect
+timeout
+downstream failure
+```
+
+Verify that child work terminates.
+
+---
+
+# VERSION 4 — STRUCTURED CONCURRENCY
+
+Add:
+
+### Python
+
+```text
+asyncio.TaskGroup
+```
+
+### Go
+
+```text
+errgroup + context
+```
+
+Verify:
+
+* child failure propagation;
+* cancellation;
+* completion;
+* cleanup.
+
+---
+
+# VERSION 5 — BOUNDED CONCURRENCY
+
+Introduce:
+
+```text
+MAX_WORKERS = N
+```
+
+Run experiments:
+
+```text
+N = 1
+N = 5
+N = 10
+N = 20
+N = 50
+```
+
+Measure:
+
+```text
+throughput
+p50
+p95
+p99
+CPU
+memory
+queue depth
+```
+
+Find the point where additional concurrency stops helping.
+
+---
+
+# VERSION 6 — BACKPRESSURE
+
+Introduce a bounded queue:
+
+```text
+Queue capacity = 100
+```
+
+Then deliberately overload the system.
+
+Observe:
+
+```text
+Queue fills
+     ↓
+Producer slows
+     ↓
+Backpressure
+```
+
+---
+
+# VERSION 7 — LOAD SHEDDING
+
+When the queue is full:
+
+```text
+Do not wait forever.
+Reject the work.
+```
+
+For HTTP:
+
+```text
+429
+```
+
+or, depending on the failure semantics:
+
+```text
+503
+```
+
+Measure how load shedding affects:
+
+* latency;
+* throughput;
+* failure rate;
+* system stability.
+
+---
+
+# VERSION 8 — RETRIES
+
+Add:
+
+```text
+Exponential Backoff
++
+Jitter
++
+Maximum Attempts
++
+Deadline
+```
+
+Simulate downstream failures.
+
+Then compare:
+
+```text
+No retry
+Retry without backoff
+Retry with exponential backoff
+Retry with backoff + jitter
+```
+
+Observe retry amplification.
+
+---
+
+# VERSION 9 — GRACEFUL SHUTDOWN
+
+Send:
+
+```text
+SIGTERM
+```
+
+The system should:
+
+```text
+Stop accepting new work
+        ↓
+Allow active work to finish where possible
+        ↓
+Cancel work past deadline
+        ↓
+Close resources
+        ↓
+Exit
+```
+
+This is mandatory for production services.
+
+---
+
+# VERSION 10 — RAG SIMULATION
+
+Replace fake document processing with:
+
+```text
+FastAPI
+     ↓
+Embedding API
+     ↓
+Qdrant
+     ↓
+PostgreSQL
+     ↓
+Reranker
+     ↓
+LLM
+```
+
+Then introduce:
+
+```text
+bounded concurrency
+timeouts
+cancellation
+rate limiting
+backpressure
+load shedding
+retries
+graceful shutdown
+```
+
+Now Day 2 becomes directly relevant to enterprise RAG engineering.
+
+---
+
+# 44. EXPERIMENT: OVERLOAD THE SYSTEM
+
+Do not merely build a working system.
+
+Break it deliberately.
+
+Generate:
+
+```text
+10 req/s
+50 req/s
+100 req/s
+500 req/s
+1,000 req/s
+```
+
+Observe:
+
+```text
+CPU
+Memory
+Queue depth
+p50
+p95
+p99
+Errors
+Timeouts
+Retries
+Connections
+```
+
+Then answer:
+
+1. What saturated first?
+2. When did queueing begin?
+3. When did p99 explode?
+4. What was the maximum stable throughput?
+5. What concurrency level produced the best throughput?
+6. What happened after saturation?
+7. Did retries make the system worse?
+8. Did load shedding improve system stability?
+9. What resource was actually the bottleneck?
+
+These questions matter more than memorizing syntax.
+
+---
+
+# 45. THE SENIOR ENGINEER PERFORMANCE LOOP
+
+Use this loop:
+
+```text
+Measure
+   ↓
+Identify bottleneck
+   ↓
+Model capacity
+   ↓
+Bound concurrency
+   ↓
+Apply backpressure
+   ↓
+Observe tail latency
+   ↓
+Test failure modes
+   ↓
+Optimize
+   ↓
+Measure again
+```
+
+Never:
+
+```text
+"Python is slow."
+"Go is faster."
+"Let's add more workers."
+"Let's make everything async."
+```
+
+Those are guesses.
+
+Senior engineering is evidence-driven.
+
+---
+
+# 46. DAY 2 NON-NEGOTIABLE MENTAL MODELS
+
+You should be able to explain these without notes:
+
+### Execution
+
+* CPU-bound vs I/O-bound
+* concurrency vs parallelism
+* async vs threading vs multiprocessing
+* goroutines vs OS threads
+
+### Python
+
+* CPython GIL
+* `asyncio`
+* event-loop blocking
+* thread pools
+* process pools
+* native extensions
+
+### Go
+
+* goroutines
+* channels
+* `select`
+* G-M-P scheduler
+* `GOMAXPROCS`
+* cancellation with `context.Context`
+* structured concurrency with `errgroup`
+
+### Capacity
+
+* CPU capacity
+* memory capacity
+* connection-pool capacity
+* GPU capacity
+* downstream API capacity
+* queue capacity
+
+### Queueing
+
+* throughput
+* latency
+* tail latency
+* Little's Law
+* queue depth
+* saturation
+
+### Protection
+
+* bounded concurrency
+* backpressure
+* admission control
+* rate limiting
+* load shedding
+* graceful degradation
+
+### Reliability
+
+* timeouts
+* cancellation
+* retries
+* exponential backoff
+* jitter
+* idempotency
+* graceful shutdown
+
+### Correctness
+
+* race conditions
+* deadlocks
+* starvation
+* goroutine/task leaks
+* ownership
+* lifecycle management
+
+---
+
+# 47. SENIOR-ENGINEER COMPETENCY CHECKLIST
+
+By the end of Day 2, I should be able to:
+
+* [ ] Explain concurrency and parallelism precisely.
+* [ ] Explain why async I/O is effective for I/O-bound workloads.
+* [ ] Explain why CPU-heavy work can block an async event loop.
+* [ ] Explain the traditional CPython GIL without claiming Python can only use one CPU.
+* [ ] Explain how Python threads, processes and native extensions differ.
+* [ ] Explain the Go G-M-P scheduler.
+* [ ] Explain what `GOMAXPROCS` controls.
+* [ ] Explain why goroutines are not OS threads.
+* [ ] Design a bounded worker pool.
+* [ ] Implement fan-out/fan-in safely.
+* [ ] Implement a pipeline with bounded queues.
+* [ ] Propagate cancellation through a request.
+* [ ] Implement timeouts and deadlines.
+* [ ] Design structured concurrent tasks with explicit ownership.
+* [ ] Explain Little's Law.
+* [ ] Distinguish throughput from latency.
+* [ ] Measure p50/p95/p99 latency.
+* [ ] Identify a saturated resource.
+* [ ] Calculate a basic concurrency budget.
+* [ ] Explain why unlimited queues are dangerous.
+* [ ] Distinguish concurrency limiting from queueing.
+* [ ] Distinguish queueing from load shedding.
+* [ ] Implement admission control.
+* [ ] Implement rate limiting.
+* [ ] Design backpressure between services.
+* [ ] Explain retry amplification.
+* [ ] Implement exponential backoff and jitter.
+* [ ] Design graceful degradation.
+* [ ] Design graceful shutdown.
+* [ ] Detect race conditions.
+* [ ] Reason about deadlocks.
+* [ ] Identify goroutine/task leaks.
+* [ ] Apply all of these concepts to a FastAPI + RAG architecture.
+* [ ] Apply the same concepts to a Go service.
+* [ ] Benchmark both rather than relying on language stereotypes.
+
+---
+
+# 48. THE DAY 2 PRINCIPLE
+
+The goal is not to become someone who knows:
+
+```text
+asyncio
+goroutines
+channels
+semaphores
+workers
+```
+
+The goal is to become someone who can look at a production system and say:
+
+> **"This system can accept 500 requests concurrently, but the downstream LLM can safely process only 20. Therefore, I need an explicit concurrency budget, bounded queue, timeout, admission policy, cancellation propagation and load-shedding strategy."**
+
+That is the difference between knowing concurrency APIs and understanding concurrent systems.
+
+For Backend + Enterprise AI engineering:
+
+> **Concurrency is not about making everything run at once. It is about making the right amount of work run at the right time without exhausting the resources that keep the system alive.**
+
+That is the Day 2 competency.
